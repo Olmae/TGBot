@@ -1,0 +1,342 @@
+import config
+import telebot
+from telebot import types
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+import logging
+import json
+import os
+
+bot = telebot.TeleBot(config.TOKEN)
+
+# Конфигурация логирования
+logging.basicConfig(level=logging.INFO)
+
+# Файлы для хранения данных
+USER_DATA_FILE = 'user_data.json'
+USER_LINKS_COUNT_FILE = 'user_links_count.json'
+ALL_USERS_FILE = 'all_users.json'
+SENT_DATA_FILE = 'sent_data.json'
+
+# Лимиты ссылок
+USER_WEEKLY_LIMIT = 6
+TOTAL_WEEKLY_LIMIT = 36
+
+
+# Функция для загрузки данных из JSON файла
+def load_json_file(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = f.read().strip()
+                if not data:
+                    return {}
+                return json.loads(data)
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка декодирования JSON в файле {filename}: {e}")
+            return {}
+    return {}
+
+
+# Функция для сохранения данных в JSON файл
+def save_json_file(filename, data):
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except IOError as e:
+        logging.error(f"Ошибка записи в файл {filename}: {e}")
+
+
+# Загрузка данных
+user_data = load_json_file(USER_DATA_FILE)
+user_links_count = load_json_file(USER_LINKS_COUNT_FILE)
+all_users = set(load_json_file(ALL_USERS_FILE).keys())  # Преобразование ключей словаря в множество
+
+
+# Загрузка отправленных данных
+def load_sent_data():
+    if os.path.exists(SENT_DATA_FILE):
+        try:
+            with open(SENT_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = f.read().strip()
+                if not data:
+                    return []
+                return json.loads(data)
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка декодирования JSON в файле {SENT_DATA_FILE}: {e}")
+            return []
+    return []
+
+
+# Сохранение отправленных данных
+def save_sent_data(data):
+    try:
+        with open(SENT_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except IOError as e:
+        logging.error(f"Ошибка записи в файл {SENT_DATA_FILE}: {e}")
+
+
+# Напоминание пользователям
+def send_daily_reminder():
+    for chat_id in all_users:
+        try:
+            bot.send_message(chat_id, "Привет! Не забудь отправить сайт на проверку сегодня!")
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 403:
+                logging.warning(f"Пользователь {chat_id} заблокировал бота. Удаляю из списка.")
+                all_users.discard(chat_id)
+                save_json_file(ALL_USERS_FILE, {uid: True for uid in all_users})
+            else:
+                logging.error(f"Ошибка при отправке сообщения пользователю {chat_id}: {e}")
+
+
+# Запуск планировщика
+scheduler = BackgroundScheduler()
+scheduler.add_job(send_daily_reminder, 'interval', days=1, start_date=datetime.now().replace(hour=9, minute=0,
+                                                                                             second=0))  # Отправка напоминания каждый день в 9:00 утра
+scheduler.start()
+
+
+# Обработчик команды /test_reminder
+@bot.message_handler(commands=['test_reminder'])
+def test_reminder(message):
+    bot.send_message(message.chat.id, "Отправляю тестовое напоминание...")
+    send_daily_reminder()
+
+
+# Получение ссылки от пользователя
+@bot.message_handler(func=lambda message: 'link' not in user_data.get(message.chat.id, {}))
+def get_link(message):
+    all_users.add(message.chat.id)
+    save_json_file(ALL_USERS_FILE, {uid: True for uid in all_users})
+
+    if message.chat.id not in user_data:
+        user_data[message.chat.id] = {}
+    user_data[message.chat.id]['link'] = message.text
+
+    bot.send_message(message.chat.id,
+                     "Спасибо за ссылку. Теперь отправьте номер решения (формат: входит в Федеральный список экстремистских материалов под номером ####).")
+
+
+def lowercase_first_char(text):
+    if not text:
+        return text
+    return text[0].lower() + text[1:]
+
+
+@bot.message_handler(func=lambda message: 'gender_selection' in user_data.get(message.chat.id, {}))
+def handle_gender_selection(message):
+    logging.info(f"Получен выбор пола от {message.chat.id}: {message.text}")
+
+    gender = message.text.strip()
+    valid_genders = ["размещен", "размещена", "размещено"]
+
+    if gender not in valid_genders:
+        bot.send_message(message.chat.id, "Пожалуйста, выберите корректный пол: размещен, размещена или размещено.")
+        return
+
+    decision_number = user_data[message.chat.id].pop('gender_selection', None)
+
+    if not decision_number:
+        bot.send_message(message.chat.id, "Не удалось найти номер решения. Попробуйте снова.")
+        return
+
+    user_data[message.chat.id]['gender'] = gender
+    save_json_file(USER_DATA_FILE, user_data)
+
+    sent_data = load_sent_data()
+    existing_data = next((item for item in sent_data if item['decision_number'] == decision_number), None)
+
+    logging.info(f"Данные для номера решения {decision_number}: {existing_data}")
+
+    if existing_data:
+        data_text = existing_data.get('data', '')
+
+        final_message = (
+            f"{user_data[message.chat.id].get('link', '')} "
+            f"{gender} "
+            f"{lowercase_first_char(data_text)}"  # Первая буква маленькая, остальное как есть
+            f"(Включён в Федеральный список экстремистских материалов под номером {decision_number})"
+        )
+
+        # Отправляем итоговое сообщение пользователю для подтверждения
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        confirm_button = types.KeyboardButton("Подтвердить")
+        restart_button = types.KeyboardButton("Начать заново")
+        markup.add(confirm_button, restart_button)
+
+        bot.send_message(message.chat.id,
+                         f"Вот итоговое сообщение:\n\n{final_message}\n\nВы хотите подтвердить или начать заново?",
+                         reply_markup=markup)
+        user_data[message.chat.id]['final_message'] = final_message
+        save_json_file(USER_DATA_FILE, user_data)
+    else:
+        bot.send_message(message.chat.id, "Не удалось найти данные для данного номера решения. Попробуйте снова.")
+
+
+@bot.message_handler(func=lambda message: message.text in ["Подтвердить", "Начать заново"])
+def handle_confirmation(message):
+    if message.text == "Подтвердить":
+        # Отправка финального сообщения в канал
+        final_message = user_data[message.chat.id].get('final_message', '')
+
+        try:
+            bot.send_message('-4223848296', final_message)
+        except telebot.apihelper.ApiTelegramException as e:
+            logging.error(f"Ошибка при отправке сообщения в канал: {e}")
+            bot.send_message(message.chat.id, "Произошла ошибка при отправке данных. Пожалуйста, попробуйте позже.")
+            return
+
+        bot.send_message(message.chat.id, "Данные обновлены и отправлены.")
+
+        # Сохраняем отправленные данные
+        sent_data = load_sent_data()
+        sent_data.append({
+            'decision_number': user_data[message.chat.id].get('decision_number', ''),
+            'data': user_data[message.chat.id].get('data', '').lower(),
+            'gender': user_data[message.chat.id].get('gender', '')
+        })
+        save_sent_data(sent_data)
+
+        # Сброс состояния пользователя
+        user_data[message.chat.id] = {}
+        save_json_file(USER_DATA_FILE, user_data)
+
+    elif message.text == "Начать заново":
+        bot.send_message(message.chat.id, "Процесс начинается заново. Пожалуйста, отправьте номер решения еще раз.")
+        user_data[message.chat.id] = {}
+        save_json_file(USER_DATA_FILE, user_data)
+
+
+@bot.message_handler(func=lambda message: 'decision_number' not in user_data.get(message.chat.id,
+                                                                                 {}) and 'gender_selection' not in user_data.get(
+    message.chat.id, {}))
+def get_decision_number(message):
+    decision_text = message.text.strip()
+
+    if not decision_text.isdigit() or len(decision_text) < 1:
+        bot.send_message(message.chat.id, "Пожалуйста, введите корректный номер решения.")
+        return
+
+    # Проверка, есть ли уже такие данные
+    sent_data = load_sent_data()
+    existing_data = next((item for item in sent_data if item['decision_number'] == decision_text), None)
+
+    if existing_data:
+        if not existing_data.get('gender'):
+            # Если нет gender, просим выбрать
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            male_button = types.KeyboardButton("размещен")
+            female_button = types.KeyboardButton("размещена")
+            neutral_button = types.KeyboardButton("размещено")
+            markup.add(male_button, female_button, neutral_button)
+
+            bot.send_message(message.chat.id,
+                             "Выберите пол: размещен, размещена или размещено.",
+                             reply_markup=markup)
+
+            user_data[message.chat.id]['gender_selection'] = decision_text
+            save_json_file(USER_DATA_FILE, user_data)
+            return
+
+        # Если все данные есть, формируем сообщение
+        gender = existing_data.get('gender', '')
+        final_message = (
+            f"{user_data[message.chat.id].get('link', '')} "
+            f"{gender} "
+            f"{existing_data.get('data', '').lower()}"
+            f"(Включён в Федеральный список экстремистских материалов под номером {decision_text})"
+        )
+        try:
+            bot.send_message('-4223848296', final_message)
+        except telebot.apihelper.ApiTelegramException as e:
+            logging.error(f"Ошибка при отправке сообщения в канал: {e}")
+            bot.send_message(message.chat.id, "Произошла ошибка при отправке данных. Пожалуйста, попробуйте позже.")
+            return
+
+        # Сообщение пользователю
+        bot.send_message(message.chat.id,
+                         "Данные с таким номером решения уже были отправлены ранее. Отчёт готов и отправлен.")
+
+        # Сброс состояния пользователя
+        user_data[message.chat.id] = {}
+        save_json_file(USER_DATA_FILE, user_data)
+        return
+
+    # Если данных с таким номером нет, продолжаем обычный процесс
+    user_data[message.chat.id]['decision_number'] = decision_text
+
+    if message.chat.id not in user_links_count:
+        user_links_count[message.chat.id] = 0
+
+    user_links_count[message.chat.id] += 1
+
+    # Отправляем сообщение в канал
+    data_text = user_data[message.chat.id].get('data', '').lower()
+
+    def capitalize_first_char(text):
+        if not text:
+            return text
+        return text[0].lower() + text[1:]
+
+    # Используем функцию
+    final_message = (
+        f"{user_data[message.chat.id]['link']} "
+        f"{user_data[message.chat.id].get('gender', '')} "
+        f"{capitalize_first_char(data_text)}"  # Первая буква маленькая, остальное как есть
+        f"(Включён в Федеральный список экстремистских материалов под номером {user_data[message.chat.id]['decision_number']})"
+    )
+
+    try:
+        bot.send_message('-4223848296', final_message)
+    except telebot.apihelper.ApiTelegramException as e:
+        logging.error(f"Ошибка при отправке сообщения в канал: {e}")
+        bot.send_message(message.chat.id, "Произошла ошибка при отправке данных. Пожалуйста, попробуйте позже.")
+        return
+
+    # Сохраняем данные
+    save_json_file(USER_DATA_FILE, user_data)
+    save_json_file(USER_LINKS_COUNT_FILE, user_links_count)
+
+    # Сохраняем отправленные данные
+    sent_data = load_sent_data()
+    sent_data.append({
+        'decision_number': decision_text,
+        'data': user_data[message.chat.id].get('data', '').lower(),
+        'gender': user_data[message.chat.id].get('gender', '')
+    })
+    save_sent_data(sent_data)
+
+    # Сообщение пользователю о его прогрессе
+    user_links = user_links_count[message.chat.id]
+    if user_links >= USER_WEEKLY_LIMIT:
+        bot.send_message(message.chat.id, f"Вы достигли лимита в {USER_WEEKLY_LIMIT} ссылок на этой неделе. Молодец!")
+    else:
+        remaining = USER_WEEKLY_LIMIT - user_links
+        bot.send_message(message.chat.id, f"Вы отправили {user_links} ссылок. Осталось {remaining}.")
+
+    # Сообщение о прогрессе для всех пользователей
+    total_links_sent = sum(user_links_count.values())
+    if total_links_sent >= TOTAL_WEEKLY_LIMIT:
+        bot.send_message(message.chat.id, f"Всего отправлено {TOTAL_WEEKLY_LIMIT} ссылок на этой неделе. Все молодцы!")
+    else:
+        remaining = TOTAL_WEEKLY_LIMIT - total_links_sent
+        bot.send_message(message.chat.id, f"Всего отправлено {total_links_sent} ссылок. Осталось {remaining}.")
+
+    # Сброс состояния пользователя
+    user_data[message.chat.id] = {}
+    save_json_file(USER_DATA_FILE, user_data)
+
+
+# Запуск бота
+if __name__ == "__main__":
+    try:
+        bot.polling(none_stop=True)
+    except ConnectionError as e:
+        logging.error('Ошибка соединения: %s', e)
+    except Exception as r:
+        logging.error('Непредвиденная ошибка: %s', r)
+    finally:
+        logging.info("Здесь всё закончилось")
+
