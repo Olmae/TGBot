@@ -7,7 +7,7 @@ def csv_to_json(csv_filename, json_filename):
     data_list = []
 
     # Открываем CSV файл
-    with open(csv_filename, mode='r', encoding='utf-8') as csvfile:
+    with open(csv_filename, mode='r', encoding='windows-1251') as csvfile:
         # Читаем CSV файл с учетом разделителя `;`
         csvreader = csv.reader(csvfile, delimiter=';')
         next(csvreader)  # Пропускаем заголовки
@@ -32,7 +32,7 @@ def csv_to_json(csv_filename, json_filename):
 
 # Укажите имена ваших файлов
 csv_filename = 'input.csv'
-json_filename = 'output.json'
+json_filename = 'sent_data.json'
 
 # Преобразуем
 csv_to_json(csv_filename, json_filename)
